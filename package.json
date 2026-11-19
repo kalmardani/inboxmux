@@ -1,0 +1,57 @@
+{
+  "name": "inboxmux",
+  "version": "0.1.0",
+  "description": "One MCP server for many mailboxes. Connect several Gmail and Microsoft 365 / Outlook accounts and use them from Claude, Codex or any MCP client.",
+  "type": "module",
+  "bin": {
+    "inboxmux": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').chmodSync('dist/index.js', 0o755)\"",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gmail",
+    "outlook",
+    "microsoft-graph",
+    "email",
+    "claude",
+    "codex"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "^2.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kalmardani/inboxmux.git"
+  },
+  "homepage": "https://github.com/kalmardani/inboxmux#readme",
+  "bugs": {
+    "url": "https://github.com/kalmardani/inboxmux/issues"
+  },
+  "author": "Kalmár Dániel"
+}
