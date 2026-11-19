@@ -32,11 +32,11 @@ inboxmux setup google --client-file ~/Downloads/client_secret_XXXX.json
 inboxmux ui
 ```
 
-Click **Connect a Gmail account**, pick the account, and keep the Gmail permission ticked on the consent screen. Repeat for each account. The send-as aliases verified in Gmail settings are picked up automatically and can be used as `from` in `create_draft`.
+Click **Connect a Gmail account**, pick the account, and keep the Gmail permission ticked on the consent screen. Repeat for each account. The send-as aliases verified in Gmail settings are picked up automatically and can be used as `from` in `create_draft` and `send_message`.
 
 ## Scope
 
-inboxmux asks for `gmail.modify`, which covers reading, labels, drafts and sending, but not permanent deletion. Google offers no narrower scope that still allows drafts. Sending stays disabled inside inboxmux until you turn it on.
+inboxmux asks for `gmail.modify`, which covers reading, labels, drafts and sending, but not permanent deletion. Google offers no narrower scope that still allows drafts. Sending and trash are on in inboxmux by default and every call needs your approval in the MCP client. Set `capabilities.send` or `capabilities.trash` to `false` in `config.json` to remove those tools.
 
 ## Existing refresh tokens
 

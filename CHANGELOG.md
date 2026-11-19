@@ -10,6 +10,7 @@
 - `update_message` takes `moveTo` for inbox, archive, spam or any folder or label, and restores messages from trash
 - `create_folder` creates Gmail labels and Outlook folders
 - `INBOXMUX_ALLOW_SEND` and `INBOXMUX_ALLOW_TRASH` accept `0`, `false`, `no` and `off`
+- `docs/agent-setup.md`, a runbook an AI agent can follow to set everything up, OAuth apps included, plus `AGENTS.md` and `CLAUDE.md` pointing agents to it
 
 ## 0.1.0
 

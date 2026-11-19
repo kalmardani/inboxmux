@@ -35,6 +35,19 @@ Claude Code / Claude Desktop / Codex / any MCP client
 
 Each user brings their own OAuth client. inboxmux ships no shared client ID, so nobody else's quota, consent screen or verification status sits between you and your mail.
 
+## Let your AI agent set it up
+
+Claude Code, Codex or any agent with a shell can do the whole setup, including the Google and Microsoft OAuth apps. Paste this, in any language:
+
+```text
+Set up inboxmux for me (https://github.com/kalmardani/inboxmux).
+Follow docs/agent-setup.md from that repository step by step,
+including the Google and Microsoft OAuth apps, connect my mail accounts,
+and add the MCP server to the clients I use.
+```
+
+The agent runs the commands and, with browser tools, most of the clicks. You sign in, accept terms and approve each mailbox yourself. The full runbook is [docs/agent-setup.md](docs/agent-setup.md).
+
 ## Quick start
 
 ```bash
