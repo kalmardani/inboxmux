@@ -179,7 +179,7 @@ inboxmux import google            import an existing Google refresh token from s
 
 ## Scope and roadmap
 
-Version 0.2 covers Gmail and Microsoft Graph mailboxes over stdio. Search and reading in the Gmail adapter have been used against real mailboxes. Sending, forwarding, attachments and moves are covered by contract tests against the documented API behaviour. The Microsoft adapter is covered by contract tests and its sign in flow was checked against two Microsoft 365 tenants, but it has not yet read a live mailbox, because both tenants required administrator approval. Reports from Microsoft users are welcome. Planned next are a generic IMAP and SMTP adapter, a remote Streamable HTTP mode for web and mobile clients, and calendar access.
+Version 0.2 covers Gmail and Microsoft Graph mailboxes over stdio. The Gmail adapter has been run end to end against a real mailbox, covering search, reading, sending with attachments (including a 3.2 MB file through the upload endpoint, checksum verified on download), forwarding with the original attachments, replies in the same thread, label creation, moves, trash and restore. The Microsoft adapter is covered by contract tests and its sign in flow was checked against two Microsoft 365 tenants, but it has not yet read a live mailbox, because both tenants required administrator approval. Reports from Microsoft users are welcome. Planned next are a generic IMAP and SMTP adapter, a remote Streamable HTTP mode for web and mobile clients, and calendar access.
 
 ## Development
 
