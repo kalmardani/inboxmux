@@ -118,7 +118,7 @@ Every tool takes `account` as an email address or a label. Message and thread id
 
 Mail is private data that strangers can write into, which makes it a prime channel for prompt injection. inboxmux limits what an injected instruction could achieve.
 
-- **You approve every send.** Sending and trash tools carry the destructive annotation, so Claude, Codex and other clients ask before each call. The server instructions tell the model to send only what the user asked for and to show recipients, subject and text first. Never set your client to auto-approve `send_message`, `send_draft` or `trash_message`.
+- **You approve every send.** Sending and trash tools carry the destructive annotation, so Claude, Codex and other clients ask before each call. The server instructions tell the model to send only what the user asked for and to show recipients, subject and text first. Never set your client to auto-approve `send_message`, `send_draft` or `trash_message`. Modes that skip every prompt, such as Claude Code's bypass permissions mode or unattended scheduled runs, skip this one too, so switch sending off on machines that work that way.
 - **Switch off what you do not need.** `capabilities.send` and `capabilities.trash` remove those tools entirely.
 - **Recipient allowlist.** `sendAllowlist` can restrict recipients to exact addresses or `@domain` entries. The server checks the saved draft, not the model's claim, and keeps a blocked message as a draft.
 - **Local files stay put unless you name them.** Attachments are only read from the folders in `attachmentSources` (your home folder by default). Links are resolved first, hidden files and folders (`.ssh`, `.aws`, `.env`, `.config`) and the inboxmux config folder are always refused.

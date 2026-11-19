@@ -34,7 +34,7 @@ Message content crosses the provider boundary and then the MCP boundary. It is w
 
 - The model sees the content of every message it reads. Anything you would not paste into a chat should not be read through inboxmux.
 - When the same MCP session also has a tool that can fetch URLs or post anywhere, a malicious message can try to make the model leak data through that tool. Keep approvals on for such tools, or run mail work in a session without them.
-- With sending on, the approval prompt of the MCP client is the main barrier between a malicious message and an outgoing mail. Never auto-approve `send_message`, `send_draft` or `trash_message`, and switch sending off where you only read.
+- With sending on, the approval prompt of the MCP client is the main barrier between a malicious message and an outgoing mail. Never auto-approve `send_message`, `send_draft` or `trash_message`, and switch sending off where you only read. Modes that skip all prompts (Claude Code bypass permissions, unattended scheduled agents) remove this barrier entirely.
 - `gmail.modify` allows sending. When sending is switched off, the restriction lives in inboxmux, not in the Google token.
 - If the keychain is unavailable, the key falls back to a `0600` file next to the token store. That protects against other users, not against software running as you.
 - Version 0.2 has not been through an external security review.
