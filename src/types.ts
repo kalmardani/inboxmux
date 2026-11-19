@@ -89,10 +89,17 @@ export interface FolderInfo {
 export interface MessageChanges {
   read?: boolean
   starred?: boolean
-  archived?: boolean
+  /**
+   * `inbox`, `archive`, `spam`, or a folder (Outlook) or label (Gmail) name or id.
+   * Moving to the inbox also restores a message from trash or spam.
+   */
+  moveTo?: string
   addLabels?: string[]
   removeLabels?: string[]
 }
+
+/** Total size cap for files attached to one outgoing message (Gmail and Exchange both accept this). */
+export const MAX_OUTGOING_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
 export interface DraftInput {
   to: string[]
@@ -104,6 +111,12 @@ export interface DraftInput {
   from?: string
   replyToMessageId?: string
   replyAll: boolean
+  /** Forward this message. Mutually exclusive with replyToMessageId. */
+  forwardMessageId?: string
+  /** Forwarding keeps the original attachments unless this is false. */
+  includeOriginalAttachments?: boolean
+  /** Files to attach, already read and checked by the server layer. */
+  attachments?: AttachmentData[]
 }
 
 export interface DraftResult {
@@ -125,6 +138,8 @@ export interface MailProvider {
   getMessage(id: string, options: ReadOptions): Promise<MessageFull>
   getThread(threadId: string, options: ReadOptions): Promise<MessageFull[]>
   listFolders(): Promise<FolderInfo[]>
+  /** Creates a Gmail label or an Outlook folder. `Parent/Child` nests it under an existing parent. */
+  createFolder(name: string): Promise<FolderInfo>
   updateMessage(id: string, changes: MessageChanges): Promise<void>
   createDraft(input: DraftInput): Promise<DraftResult>
   draftRecipients(draftId: string): Promise<string[]>

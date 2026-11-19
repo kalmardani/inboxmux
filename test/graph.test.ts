@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildGraphSearch, decodePageToken, encodePageToken, GraphProvider, GRAPH_ROOT } from '../src/providers/graph.js'
+import { buildGraphSearch, checkUploadUrl, decodePageToken, encodePageToken, GraphProvider, GRAPH_ROOT } from '../src/providers/graph.js'
 import type { SearchQuery } from '../src/types.js'
 import { account, fakeClient } from './helpers.js'
 
@@ -98,7 +98,7 @@ describe('GraphProvider', () => {
 
   it('archives by moving and merges categories case insensitively', async () => {
     const http = fakeClient((call) => (call.method === 'GET' ? { categories: ['Red', 'Clients'] } : {}))
-    await new GraphProvider(ms, http).updateMessage('A1', { read: true, addLabels: ['clients', 'Blue'], removeLabels: ['red'], archived: true })
+    await new GraphProvider(ms, http).updateMessage('A1', { read: true, addLabels: ['clients', 'Blue'], removeLabels: ['red'], moveTo: 'archive' })
     expect(http.calls[1]).toMatchObject({ method: 'PATCH', body: { isRead: true, categories: ['clients', 'Blue'] } })
     expect(http.calls[2]).toMatchObject({ method: 'POST', body: { destinationId: 'archive' } })
     expect(http.calls[2]?.url).toBe(`${GRAPH_ROOT}/messages/A1/move`)
@@ -107,5 +107,124 @@ describe('GraphProvider', () => {
   it('only sends real drafts', async () => {
     const http = fakeClient(() => ({ isDraft: false }))
     await expect(new GraphProvider(ms, http).draftRecipients('A1')).rejects.toThrow(/not a draft/)
+  })
+})
+
+describe('GraphProvider moves', () => {
+  it('maps spam to junkemail and other targets to a folder id', async () => {
+    const http = fakeClient((call) => {
+      if (call.url.includes('/mailFolders?')) return { value: [{ id: 'F-INBOX', displayName: 'Inbox' }, { id: 'F-CL', displayName: 'Clients', childFolderCount: 0 }] }
+      return {}
+    })
+    const provider = new GraphProvider(ms, http)
+    await provider.updateMessage('A1', { moveTo: 'spam' })
+    expect(http.calls.at(-1)?.body).toEqual({ destinationId: 'junkemail' })
+    await provider.updateMessage('A1', { moveTo: 'clients' })
+    expect(http.calls.at(-1)?.body).toEqual({ destinationId: 'F-CL' })
+    await provider.updateMessage('A1', { moveTo: 'inbox' })
+    expect(http.calls.at(-1)?.body).toEqual({ destinationId: 'inbox' })
+    await expect(provider.updateMessage('A1', { moveTo: 'Nowhere' })).rejects.toThrow(/No folder "Nowhere"/)
+    await expect(provider.updateMessage('A1', { moveTo: 'trash' })).rejects.toThrow(/trash_message/)
+  })
+})
+
+describe('GraphProvider folders', () => {
+  it('creates top level and nested folders', async () => {
+    const http = fakeClient((call) => {
+      if (call.url.includes('/mailFolders?')) return { value: [{ id: 'F-CL', displayName: 'Clients' }] }
+      return { id: 'NEW', displayName: (call.body as { displayName: string }).displayName }
+    })
+    const provider = new GraphProvider(ms, http)
+    expect(await provider.createFolder('Receipts')).toEqual({ id: 'NEW', name: 'Receipts', kind: 'user' })
+    expect(http.calls[0]).toMatchObject({ method: 'POST', url: `${GRAPH_ROOT}/mailFolders`, body: { displayName: 'Receipts' } })
+    expect(await provider.createFolder('clients/Acme')).toEqual({ id: 'NEW', name: 'clients/Acme', kind: 'user' })
+    expect(http.calls.at(-1)).toMatchObject({ url: `${GRAPH_ROOT}/mailFolders/F-CL/childFolders`, body: { displayName: 'Acme' } })
+    await expect(provider.createFolder('Nope/Child')).rejects.toThrow(/No folder "Nope"/)
+  })
+})
+
+describe('GraphProvider forwarding and attachments', () => {
+  it('forwards with createForward, keeps the comment and attaches small files inline', async () => {
+    const http = fakeClient((call) => (call.url.endsWith('/createForward') ? { id: 'F1', conversationId: 'C1' } : {}))
+    const draft = await new GraphProvider(ms, http).createDraft({
+      to: ['bob@x.com'],
+      cc: [],
+      bcc: [],
+      body: 'FYI',
+      html: false,
+      replyAll: false,
+      forwardMessageId: 'A1',
+      attachments: [{ filename: 'notes.txt', mimeType: 'text/plain', data: Buffer.from('local') }],
+    })
+    expect(draft).toMatchObject({ draftId: 'F1', threadId: 'C1' })
+    expect(http.calls[0]?.url).toBe(`${GRAPH_ROOT}/messages/A1/createForward`)
+    expect(http.calls[0]?.body).toEqual({ toRecipients: [{ emailAddress: { address: 'bob@x.com' } }], comment: 'FYI' })
+    expect(http.calls[1]).toMatchObject({
+      method: 'POST',
+      url: `${GRAPH_ROOT}/messages/F1/attachments`,
+      body: { '@odata.type': '#microsoft.graph.fileAttachment', name: 'notes.txt', contentType: 'text/plain', contentBytes: Buffer.from('local').toString('base64') },
+    })
+  })
+
+  it('puts HTML on top of the quoted original and can drop original attachments', async () => {
+    const http = fakeClient((call) => {
+      if (call.url.endsWith('/createForward')) return { id: 'F2' }
+      if (call.url.includes('$select=body')) return { body: { contentType: 'html', content: '<html><body class="x"><p>Original</p></body></html>' } }
+      if (call.url.includes('/attachments?')) return { value: [{ id: 'AT1' }, { id: 'AT2' }] }
+      return { id: 'F2' }
+    })
+    await new GraphProvider(ms, http).createDraft({
+      to: ['bob@x.com'],
+      cc: [],
+      bcc: [],
+      body: '<p>See below</p>',
+      html: true,
+      replyAll: false,
+      forwardMessageId: 'A1',
+      includeOriginalAttachments: false,
+    })
+    expect(http.calls[0]?.body).toEqual({ toRecipients: [{ emailAddress: { address: 'bob@x.com' } }] })
+    expect(http.calls[1]?.headers.prefer).toContain('outlook.body-content-type="html"')
+    expect(http.calls[2]).toMatchObject({
+      method: 'PATCH',
+      body: { body: { contentType: 'HTML', content: '<html><body class="x"><p>See below</p><br><p>Original</p></body></html>' } },
+    })
+    expect(http.calls.filter((c) => c.method === 'DELETE').map((c) => c.url)).toEqual([
+      `${GRAPH_ROOT}/messages/F2/attachments/AT1`,
+      `${GRAPH_ROOT}/messages/F2/attachments/AT2`,
+    ])
+  })
+
+  it('uploads large files in chunks without sending the bearer token', async () => {
+    const uploadUrl = 'https://outlook.office.com/api/v2.0/Users/x/Messages/D1/AttachmentSessions/s1?authtoken=abc'
+    const http = fakeClient((call) => {
+      if (call.url.endsWith('/createUploadSession')) return { uploadUrl }
+      return { id: 'D1' }
+    })
+    const size = 320 * 1024 * 12 + 1000
+    await new GraphProvider(ms, http).createDraft({
+      to: ['a@x.com'],
+      cc: [],
+      bcc: [],
+      subject: 'Big',
+      body: 'b',
+      html: false,
+      replyAll: false,
+      attachments: [{ filename: 'big.bin', mimeType: 'application/octet-stream', data: Buffer.alloc(size, 7) }],
+    })
+    const session = http.calls.find((c) => c.url.endsWith('/createUploadSession'))
+    expect(session?.body).toEqual({ AttachmentItem: { attachmentType: 'file', name: 'big.bin', size, contentType: 'application/octet-stream' } })
+    const puts = http.calls.filter((c) => c.method === 'PUT')
+    expect(puts.every((c) => c.external && c.url === uploadUrl && !c.headers.authorization)).toBe(true)
+    expect(puts.map((c) => c.headers['content-range'])).toEqual([`bytes 0-${320 * 1024 * 12 - 1}/${size}`, `bytes ${320 * 1024 * 12}-${size - 1}/${size}`])
+  })
+
+  it('accepts only Microsoft upload hosts', () => {
+    expect(checkUploadUrl('https://outlook.office.com/api/x')).toBe('https://outlook.office.com/api/x')
+    expect(checkUploadUrl('https://outlook.office365.com/api/x')).toBe('https://outlook.office365.com/api/x')
+    expect(() => checkUploadUrl('https://evil.example/office.com')).toThrow(/unexpected upload address/)
+    expect(() => checkUploadUrl('http://outlook.office.com/api/x')).toThrow(/unexpected upload address/)
+    expect(() => checkUploadUrl('https://outlook.office.com.evil.example/x')).toThrow(/unexpected upload address/)
+    expect(() => checkUploadUrl(undefined)).toThrow(/no usable upload address/)
   })
 })

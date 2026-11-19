@@ -152,9 +152,9 @@ describe('GmailProvider', () => {
       if (call.url.endsWith('/labels')) return { labels: [{ id: 'Label_7', name: 'Clients' }] }
       return {}
     })
-    await new GmailProvider(account(), http).updateMessage('m1', { read: true, archived: true, starred: true, addLabels: ['clients'] })
+    await new GmailProvider(account(), http).updateMessage('m1', { read: true, moveTo: 'archive', starred: true, addLabels: ['clients'] })
     const modify = http.calls.find((c) => c.url.endsWith('/modify'))
-    expect(modify?.body).toEqual({ addLabelIds: ['STARRED', 'Label_7'], removeLabelIds: ['UNREAD', 'INBOX'] })
+    expect(modify?.body).toEqual({ addLabelIds: ['STARRED', 'Label_7'], removeLabelIds: ['UNREAD', 'INBOX', 'SPAM'] })
     await expect(new GmailProvider(account(), http).updateMessage('m1', { addLabels: ['nope'] })).rejects.toThrow(/does not exist/)
   })
 
@@ -166,5 +166,111 @@ describe('GmailProvider', () => {
 
   it('decodes subjects that arrive encoded', () => {
     expect(decodeMimeWords('=?UTF-8?B?w4lsxZEgdGVzenQ=?=')).toBe('Élő teszt')
+  })
+})
+
+describe('GmailProvider moves', () => {
+  it('restores from trash when moving to the inbox and marks spam', async () => {
+    const http = fakeClient((call) => (call.url.includes('format=minimal') ? { id: 'm1', labelIds: ['TRASH'] } : {}))
+    const gmail = new GmailProvider(account(), http)
+    await gmail.updateMessage('m1', { moveTo: 'inbox' })
+    expect(http.calls.map((c) => `${c.method} ${c.url.split('/users/me')[1]}`)).toEqual([
+      'GET /messages/m1?format=minimal',
+      'POST /messages/m1/untrash',
+      'POST /messages/m1/modify',
+    ])
+    expect(http.calls[2]?.body).toEqual({ addLabelIds: ['INBOX'], removeLabelIds: ['SPAM'] })
+    await gmail.updateMessage('m2', { moveTo: 'spam' })
+    expect(http.calls.at(-1)?.body).toEqual({ addLabelIds: ['SPAM'], removeLabelIds: ['INBOX'] })
+    await expect(gmail.updateMessage('m3', { moveTo: 'trash' })).rejects.toThrow(/trash_message/)
+  })
+
+  it('moves to a label like Gmail does', async () => {
+    const http = fakeClient((call) => {
+      if (call.url.endsWith('/labels')) return { labels: [{ id: 'Label_3', name: 'Projects/KD' }] }
+      return { id: 'm1', labelIds: ['INBOX'] }
+    })
+    await new GmailProvider(account(), http).updateMessage('m1', { moveTo: 'projects/kd' })
+    expect(http.calls.find((c) => c.url.endsWith('/modify'))?.body).toEqual({ addLabelIds: ['Label_3'], removeLabelIds: ['INBOX', 'SPAM'] })
+  })
+})
+
+describe('GmailProvider labels', () => {
+  it('creates a visible label', async () => {
+    const http = fakeClient(() => ({ id: 'Label_9', name: 'Projects/KD' }))
+    expect(await new GmailProvider(account(), http).createFolder('Projects/KD')).toEqual({ id: 'Label_9', name: 'Projects/KD', kind: 'user' })
+    expect(http.calls[0]).toMatchObject({ method: 'POST', body: { name: 'Projects/KD', labelListVisibility: 'labelShow', messageListVisibility: 'show' } })
+  })
+})
+
+describe('GmailProvider forwarding and attachments', () => {
+  const draftsRoute = (original: GmailMessage) => (call: { url: string }) => {
+    if (call.url.includes('/drafts')) return { id: 'd1', message: { id: 'm9', threadId: original.threadId } }
+    if (call.url.includes('/attachments/')) return { data: Buffer.from('%PDF').toString('base64url') }
+    return original
+  }
+  const rawOf = (body: unknown) => Buffer.from((body as { message: { raw: string } }).message.raw, 'base64url').toString('utf8')
+
+  it('forwards with the original text, headers and attachments in the same thread', async () => {
+    const http = fakeClient(draftsRoute(multipart))
+    const draft = await new GmailProvider(account(), http).createDraft({
+      to: ['bob@x.com'],
+      cc: [],
+      bcc: [],
+      body: 'FYI',
+      html: false,
+      replyAll: false,
+      forwardMessageId: 'm1',
+    })
+    expect(draft).toMatchObject({ draftId: 'd1', threadId: 't1' })
+    const post = http.calls.find((c) => c.url.endsWith('/drafts'))
+    expect((post?.body as { message: { threadId: string } }).message.threadId).toBe('t1')
+    const raw = rawOf(post?.body)
+    expect(raw).toContain('To: bob@x.com')
+    expect(raw).toContain(`Subject: =?UTF-8?B?${Buffer.from('Fwd: Élő teszt').toString('base64')}?=`)
+    expect(raw).toContain('References: <orig@x.com>')
+    expect(raw).toMatch(/multipart\/mixed/)
+    expect(raw).toContain('name="report.pdf"')
+    const textPart = /charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+?)\r\n--/.exec(raw)?.[1] ?? ''
+    const text = Buffer.from(textPart.replace(/\r\n/g, ''), 'base64').toString('utf8')
+    expect(text).toContain('FYI')
+    expect(text).toContain('---------- Forwarded message ---------')
+    expect(text).toContain('From: Alice <alice@x.com>')
+    expect(text).toContain('Tűz')
+  })
+
+  it('can forward without the original attachments and adds local files', async () => {
+    const http = fakeClient(draftsRoute(multipart))
+    await new GmailProvider(account(), http).createDraft({
+      to: ['bob@x.com'],
+      cc: [],
+      bcc: [],
+      body: 'Here',
+      html: false,
+      replyAll: false,
+      forwardMessageId: 'm1',
+      includeOriginalAttachments: false,
+      attachments: [{ filename: 'notes.txt', mimeType: 'text/plain', data: Buffer.from('local') }],
+    })
+    const raw = rawOf(http.calls.find((c) => c.url.endsWith('/drafts'))?.body)
+    expect(raw).not.toContain('report.pdf')
+    expect(raw).toContain('name="notes.txt"')
+    expect(http.calls.some((c) => c.url.includes('/attachments/'))).toBe(false)
+  })
+
+  it('uses the upload endpoint for large messages and enforces the 25 MB cap', async () => {
+    const http = fakeClient(() => ({ id: 'd2', message: { id: 'm2', threadId: 't2' } }))
+    const gmail = new GmailProvider(account(), http)
+    const big = { filename: 'big.bin', mimeType: 'application/octet-stream', data: Buffer.alloc(3_000_000, 1) }
+    await gmail.createDraft({ to: ['a@x.com'], cc: [], bcc: [], subject: 'Big', body: 'b', html: false, replyAll: false, attachments: [big] })
+    const upload = http.calls[0]
+    expect(upload?.url).toBe('https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=multipart')
+    expect(upload?.headers['content-type']).toMatch(/^multipart\/related; boundary=inboxmux_up_/)
+    expect(String(upload?.body)).toContain('Content-Type: message/rfc822')
+    expect(String(upload?.body)).toContain('Subject: Big')
+    const huge = { ...big, data: Buffer.alloc(26 * 1024 * 1024) }
+    await expect(
+      gmail.createDraft({ to: ['a@x.com'], cc: [], bcc: [], subject: 'Huge', body: 'b', html: false, replyAll: false, attachments: [huge] }),
+    ).rejects.toThrow(/limit is 25 MB/)
   })
 })

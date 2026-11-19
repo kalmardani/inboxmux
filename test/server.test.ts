@@ -1,10 +1,10 @@
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { describe, expect, it } from 'vitest'
 import { createMcpServer, safeFilename, UNTRUSTED_NOTICE, type ServerDeps } from '../src/server.js'
-import { UserFacingError, type AccountMeta, type MailProvider, type MessageSummary } from '../src/types.js'
+import { UserFacingError, type AccountMeta, type DraftInput, type MailProvider, type MessageChanges, type MessageSummary } from '../src/types.js'
 import { account, tempDir } from './helpers.js'
 
 const gmail = account({ email: 'me@gmail.com', label: 'home' })
@@ -28,6 +28,7 @@ function fakeProvider(acc: AccountMeta, overrides: Partial<MailProvider> = {}): 
     }),
     getThread: async () => [],
     listFolders: async () => [{ id: 'INBOX', name: 'INBOX', kind: 'system' }],
+    createFolder: async (name) => ({ id: `id-${name}`, name, kind: 'user' }),
     updateMessage: async () => undefined,
     createDraft: async () => ({ draftId: 'd1' }),
     draftRecipients: async () => ['friend@ok.com', 'stranger@evil.com'],
@@ -50,7 +51,7 @@ async function connect(overrides: Partial<ServerDeps> = {}, providers: Record<st
       },
     },
     provider: (acc) => providers[acc.email] ?? fakeProvider(acc),
-    config: { capabilities: { send: false, trash: false }, sendAllowlist: [], attachmentsDir: tempDir() },
+    config: { capabilities: { send: false, trash: false }, sendAllowlist: [], attachmentsDir: tempDir(), attachmentSources: [tempDir()] },
     version: 'test',
     ...overrides,
   }
@@ -70,10 +71,11 @@ describe('MCP server', () => {
   it('hides send and trash tools unless enabled', async () => {
     const { client } = await connect()
     const names = (await client.listTools()).tools.map((t) => t.name).sort()
-    expect(names).toEqual(['create_draft', 'get_attachment', 'get_message', 'get_thread', 'list_accounts', 'list_folders', 'search_messages', 'update_message'])
+    expect(names).toEqual(['create_draft', 'create_folder', 'get_attachment', 'get_message', 'get_thread', 'list_accounts', 'list_folders', 'search_messages', 'update_message'])
     const enabled = await connect({ config: { capabilities: { send: true, trash: true }, sendAllowlist: [], attachmentsDir: tempDir() } })
     const all = (await enabled.client.listTools()).tools.map((t) => t.name)
     expect(all).toContain('send_draft')
+    expect(all).toContain('send_message')
     expect(all).toContain('trash_message')
   })
 
@@ -89,6 +91,7 @@ describe('MCP server', () => {
     const { data } = await call('list_accounts')
     expect(data.accounts.map((a: AccountMeta) => a.email)).toEqual(['me@gmail.com', 'me@corp.com'])
     expect(data.capabilities).toEqual({ send: false, trash: false })
+    expect(data.attachFrom).toHaveLength(1)
   })
 
   it('searches all accounts, merges newest first and survives one failing account', async () => {
@@ -179,6 +182,113 @@ describe('MCP server', () => {
     const res = await call('list_folders', { account: 'home' })
     expect(res.isError).toBe(true)
     expect(res.text).not.toContain('abc123')
+  })
+})
+
+describe('sending, attachments and moves', () => {
+  const sendConfig = (extra: Partial<ServerDeps['config']> = {}): ServerDeps['config'] => ({
+    capabilities: { send: true, trash: true },
+    sendAllowlist: [],
+    attachmentsDir: tempDir(),
+    attachmentSources: [tempDir()],
+    ...extra,
+  })
+
+  it('sends in one step through a draft and audits it without the body', async () => {
+    const steps: string[] = []
+    let drafted: DraftInput | undefined
+    const providers = {
+      'me@gmail.com': fakeProvider(gmail, {
+        createDraft: async (input) => {
+          drafted = input
+          steps.push('draft')
+          return { draftId: 'd7', threadId: 't7' }
+        },
+        draftRecipients: async () => (steps.push('check'), ['friend@ok.com']),
+        sendDraft: async (id) => void steps.push(`send ${id}`),
+      }),
+    }
+    const auditFile = join(tempDir(), 'audit.log')
+    const { call } = await connect({ config: sendConfig(), auditFile }, providers)
+    const { data } = await call('send_message', { account: 'home', to: ['friend@ok.com'], subject: 'Hi', body: 'secret text' })
+    expect(data).toMatchObject({ ok: true, sent: true, recipients: 1, threadId: 't7' })
+    expect(steps).toEqual(['draft', 'check', 'send d7'])
+    expect(drafted).toMatchObject({ to: ['friend@ok.com'], subject: 'Hi', body: 'secret text', attachments: [] })
+    const line = JSON.parse(readFileSync(auditFile, 'utf8').trim())
+    expect(line).toMatchObject({ tool: 'send_message', ok: true, recipients: 1, forward: false, attachments: 0 })
+    expect(JSON.stringify(line)).not.toContain('secret text')
+  })
+
+  it('keeps the draft and refuses to send outside the allowlist', async () => {
+    let sent = false
+    const providers = { 'me@gmail.com': fakeProvider(gmail, { sendDraft: async () => void (sent = true) }) }
+    const { call } = await connect({ config: sendConfig({ sendAllowlist: ['@ok.com'] }) }, providers)
+    const res = await call('send_message', { account: 'home', to: ['friend@ok.com'], subject: 'Hi', body: 'b' })
+    expect(res.isError).toBe(true)
+    expect(res.text).toMatch(/stranger@evil.com/)
+    expect(res.text).toMatch(/saved as draft d1/)
+    expect(sent).toBe(false)
+  })
+
+  it('validates reply and forward combinations', async () => {
+    const { call } = await connect({ config: sendConfig() })
+    expect((await call('create_draft', { account: 'home', replyToMessageId: 'm1', forwardMessageId: 'm2', body: 'x' })).text).toMatch(/not both/)
+    expect((await call('create_draft', { account: 'home', forwardMessageId: 'm2' })).text).toMatch(/forward needs at least one address/)
+    const ok = await call('create_draft', { account: 'home', forwardMessageId: 'm2', to: ['a@x.com'] })
+    expect(ok.data).toMatchObject({ ok: true, sent: false })
+  })
+
+  it('attaches local files only from the allowed folders, never hidden ones', async () => {
+    const root = tempDir()
+    const outside = tempDir()
+    const configDir = join(root, 'inboxmux-config')
+    mkdirSync(join(root, 'Documents'))
+    mkdirSync(join(root, '.ssh'))
+    mkdirSync(configDir)
+    writeFileSync(join(root, 'Documents', 'Ajánlat.pdf'), '%PDF-ok')
+    writeFileSync(join(root, '.ssh', 'id_ed25519'), 'PRIVATE')
+    writeFileSync(join(root, '.env'), 'SECRET=1')
+    writeFileSync(join(configDir, 'accounts.json'), '{}')
+    writeFileSync(join(outside, 'x.txt'), 'outside')
+    // Windows needs extra rights for symlinks, the link case runs where it can.
+    let linked = true
+    try {
+      symlinkSync(join(root, '.ssh', 'id_ed25519'), join(root, 'Documents', 'innocent.txt'))
+    } catch {
+      linked = false
+    }
+    let drafted: DraftInput | undefined
+    const providers = { 'me@gmail.com': fakeProvider(gmail, { createDraft: async (input) => ((drafted = input), { draftId: 'd1' }) }) }
+    const { call } = await connect({ config: { ...sendConfig({ attachmentSources: [root] }), dir: configDir } }, providers)
+    const draft = (attachments: string[]) => call('create_draft', { account: 'home', to: ['a@x.com'], subject: 's', body: 'b', attachments })
+
+    expect((await draft([join(root, 'Documents', 'Ajánlat.pdf')])).isError).toBe(false)
+    expect(drafted?.attachments).toEqual([{ filename: 'Ajánlat.pdf', mimeType: 'application/pdf', data: Buffer.from('%PDF-ok') }])
+    expect((await draft([join(root, '.ssh', 'id_ed25519')])).text).toMatch(/hidden/)
+    expect((await draft([join(root, '.env')])).text).toMatch(/hidden/)
+    if (linked) expect((await draft([join(root, 'Documents', 'innocent.txt')])).text).toMatch(/hidden/)
+    expect((await draft([join(configDir, 'accounts.json')])).text).toMatch(/config folder/)
+    expect((await draft([join(outside, 'x.txt')])).text).toMatch(/outside the folders/)
+    expect((await draft(['Documents/Ajánlat.pdf'])).text).toMatch(/absolute path/)
+    expect((await draft([join(root, 'missing.pdf')])).text).toMatch(/not found/)
+    expect((await draft([join(root, 'Documents')])).text).toMatch(/not a regular file/)
+  })
+
+  it('creates folders and rejects odd names', async () => {
+    const { call } = await connect()
+    expect((await call('create_folder', { account: 'home', name: ' Clients/Acme ' })).data.folder).toEqual({ id: 'id-Clients/Acme', name: 'Clients/Acme', kind: 'user' })
+    expect((await call('create_folder', { account: 'home', name: 'a\nb' })).isError).toBe(true)
+  })
+
+  it('turns archived into a move and refuses both at once', async () => {
+    let seen: MessageChanges | undefined
+    const providers = { 'me@gmail.com': fakeProvider(gmail, { updateMessage: async (_id, changes) => void (seen = changes) }) }
+    const { call } = await connect({}, providers)
+    await call('update_message', { account: 'home', id: 'm1', archived: true })
+    expect(seen).toEqual({ moveTo: 'archive' })
+    await call('update_message', { account: 'home', id: 'm1', moveTo: 'Clients', read: true })
+    expect(seen).toEqual({ moveTo: 'Clients', read: true })
+    expect((await call('update_message', { account: 'home', id: 'm1', archived: false, moveTo: 'spam' })).text).toMatch(/not both/)
   })
 })
 

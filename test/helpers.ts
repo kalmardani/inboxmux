@@ -19,6 +19,8 @@ export interface Call {
   method: string
   body?: unknown
   headers: Record<string, string>
+  /** True when the call went through `external` (no bearer token). */
+  external?: boolean
 }
 
 /** AuthedClient double. `route` returns the JSON body for a call or throws. */
@@ -49,6 +51,11 @@ export function fakeClient(route: (call: Call) => unknown): AuthedClient & { cal
     },
     async send(url: string, init?: RequestInit) {
       route(record(url, init))
+    },
+    async external<T>(url: string, init?: RequestInit) {
+      const call = record(url, init)
+      call.external = true
+      return route(call) as T
     },
   }
 }

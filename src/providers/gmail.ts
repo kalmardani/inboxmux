@@ -1,5 +1,7 @@
+import { randomBytes } from 'node:crypto'
 import { mapLimit, type AuthedClient } from '../http.js'
 import {
+  MAX_OUTGOING_ATTACHMENT_BYTES,
   UserFacingError,
   type AccountMeta,
   type AttachmentData,
@@ -16,9 +18,12 @@ import {
   type SearchResult,
 } from '../types.js'
 import { buildMime, charsetOf, decodeBytes, decodeMimeWords, parseAddressList } from './mime.js'
-import { decodeEntities, htmlToText, tidy, truncate } from './text.js'
+import { decodeEntities, escapeHtml, htmlToText, tidy, truncate } from './text.js'
 
 const BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
+const UPLOAD = 'https://gmail.googleapis.com/upload/gmail/v1/users/me'
+/** Above this raw size a draft goes through the upload endpoint, the JSON endpoint caps requests near 5 MB. */
+const JSON_DRAFT_LIMIT = 3_500_000
 const SUMMARY_HEADERS = ['From', 'To', 'Subject', 'Date']
 
 interface GmailHeader {
@@ -164,14 +169,25 @@ export class GmailProvider implements MailProvider {
       .map((l) => ({ id: l.id, name: l.name, kind: l.type === 'system' ? 'system' : 'user' }))
   }
 
+  async createFolder(name: string): Promise<FolderInfo> {
+    const label = await this.http.json<{ id: string; name: string }>(`${BASE}/labels`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, labelListVisibility: 'labelShow', messageListVisibility: 'show' }),
+    })
+    this.labelsCache = undefined
+    return { id: label.id, name: label.name, kind: 'user' }
+  }
+
   async updateMessage(id: string, changes: MessageChanges): Promise<void> {
     const add = new Set<string>()
     const remove = new Set<string>()
     if (changes.read !== undefined) (changes.read ? remove : add).add('UNREAD')
     if (changes.starred !== undefined) (changes.starred ? add : remove).add('STARRED')
-    if (changes.archived !== undefined) (changes.archived ? remove : add).add('INBOX')
+    if (changes.moveTo !== undefined) await this.applyMove(id, changes.moveTo, add, remove)
     for (const name of changes.addLabels ?? []) add.add(await this.labelId(name))
     for (const name of changes.removeLabels ?? []) remove.add(await this.labelId(name))
+    if (!add.size && !remove.size) return
     await this.http.send(`${BASE}/messages/${enc(id)}/modify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -179,13 +195,34 @@ export class GmailProvider implements MailProvider {
     })
   }
 
+  /** Gmail has labels, not folders: a move adds the target and drops INBOX and SPAM. Trashed messages are restored first. */
+  private async applyMove(id: string, target: string, add: Set<string>, remove: Set<string>): Promise<void> {
+    const key = target.trim().toLowerCase()
+    if (key === 'trash') throw new UserFacingError('invalid_request', 'Use trash_message to move a message to trash.')
+    const current = await this.http.json<GmailMessage>(`${BASE}/messages/${enc(id)}?format=minimal`)
+    if (current.labelIds?.includes('TRASH')) await this.http.send(`${BASE}/messages/${enc(id)}/untrash`, { method: 'POST' })
+    if (key === 'inbox') {
+      add.add('INBOX')
+      remove.add('SPAM')
+    } else if (key === 'spam') {
+      add.add('SPAM')
+      remove.add('INBOX')
+    } else {
+      if (key !== 'archive') add.add(await this.labelId(target))
+      remove.add('INBOX')
+      remove.add('SPAM')
+    }
+  }
+
   async createDraft(input: DraftInput): Promise<DraftResult> {
     let to = input.to
     let cc = input.cc
     let subject = input.subject
+    let body = input.body
     let inReplyTo: string | undefined
     let references: string | undefined
     let threadId: string | undefined
+    const attachments: AttachmentData[] = [...(input.attachments ?? [])]
     if (input.replyToMessageId) {
       const params = new URLSearchParams({ format: 'metadata' })
       for (const h of ['Subject', 'From', 'Reply-To', 'To', 'Cc', 'Message-ID', 'References']) params.append('metadataHeaders', h)
@@ -206,21 +243,73 @@ export class GmailProvider implements MailProvider {
       inReplyTo = messageId
       references = [header(original.payload, 'References'), messageId].filter(Boolean).join(' ') || undefined
       threadId = original.threadId
+    } else if (input.forwardMessageId) {
+      const original = await this.http.json<GmailMessage>(`${BASE}/messages/${enc(input.forwardMessageId)}?format=full`)
+      const parts = collectParts(original.payload)
+      const originalSubject = decodeMimeWords(header(original.payload, 'Subject') ?? '')
+      subject ??= /^(fwd?|fw):/i.test(originalSubject) ? originalSubject : `Fwd: ${originalSubject}`
+      body = await this.forwardBody(original, parts, input)
+      const messageId = header(original.payload, 'Message-ID')
+      references = [header(original.payload, 'References'), messageId].filter(Boolean).join(' ') || undefined
+      threadId = original.threadId
+      if (input.includeOriginalAttachments !== false) {
+        for (const part of parts.attachments) attachments.push(await this.partData(original, part.id))
+      }
     }
     if (!to.length) throw new UserFacingError('invalid_draft', 'A draft needs at least one recipient in `to`.')
+    const total = attachments.reduce((sum, file) => sum + file.data.length, 0)
+    if (total > MAX_OUTGOING_ATTACHMENT_BYTES) {
+      throw new UserFacingError('too_large', `The attachments add up to ${(total / 1048576).toFixed(1)} MB, the limit is 25 MB.`)
+    }
     const from = input.from ? await this.alias(input.from) : undefined
-    const raw = buildMime({ from, to, cc, bcc: input.bcc, subject: subject ?? '', body: input.body, html: input.html, inReplyTo, references })
-    const draft = await this.http.json<{ id: string; message?: { id: string; threadId: string } }>(`${BASE}/drafts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: { raw: Buffer.from(raw).toString('base64url'), ...(threadId ? { threadId } : {}) } }),
-    })
+    const raw = buildMime({ from, to, cc, bcc: input.bcc, subject: subject ?? '', body, html: input.html, inReplyTo, references, attachments })
+    const draft = await this.saveDraft(raw, threadId)
     return {
       draftId: draft.id,
       messageId: draft.message?.id,
       threadId: draft.message?.threadId,
       webLink: `https://mail.google.com/mail/?authuser=${enc(this.account.email)}#drafts`,
     }
+  }
+
+  private async saveDraft(raw: string, threadId?: string): Promise<{ id: string; message?: { id: string; threadId: string } }> {
+    if (raw.length <= JSON_DRAFT_LIMIT) {
+      return this.http.json(`${BASE}/drafts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: { raw: Buffer.from(raw).toString('base64url'), ...(threadId ? { threadId } : {}) } }),
+      })
+    }
+    const b = `inboxmux_up_${randomBytes(12).toString('hex')}`
+    const meta = JSON.stringify(threadId ? { message: { threadId } } : {})
+    return this.http.json(`${UPLOAD}/drafts?uploadType=multipart`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/related; boundary=${b}` },
+      body:
+        `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n` +
+        `--${b}\r\nContent-Type: message/rfc822\r\n\r\n${raw}\r\n--${b}--\r\n`,
+    })
+  }
+
+  /** The new text on top, then the original headers and body, as Gmail itself forwards. */
+  private async forwardBody(original: GmailMessage, parts: CollectedParts, input: DraftInput): Promise<string> {
+    const p = original.payload
+    const lines = [
+      '---------- Forwarded message ---------',
+      `From: ${decodeMimeWords(header(p, 'From') ?? '')}`,
+      `Date: ${header(p, 'Date') ?? ''}`,
+      `Subject: ${decodeMimeWords(header(p, 'Subject') ?? '')}`,
+      `To: ${decodeMimeWords(header(p, 'To') ?? '')}`,
+    ]
+    const cc = header(p, 'Cc')
+    if (cc) lines.push(`Cc: ${decodeMimeWords(cc)}`)
+    if (input.html) {
+      const html = await this.decodeParts(original.id, parts.html)
+      const quoted = html || escapeHtml(await this.decodeParts(original.id, parts.text)).replace(/\r?\n/g, '<br>')
+      return `${input.body}<br><br><div>${lines.map(escapeHtml).join('<br>')}</div><br>${quoted}`
+    }
+    const text = (await this.decodeParts(original.id, parts.text)) || htmlToText(await this.decodeParts(original.id, parts.html))
+    return `${input.body}\n\n${lines.join('\n')}\n\n${tidy(text)}`
   }
 
   async draftRecipients(draftId: string): Promise<string[]> {
@@ -245,12 +334,16 @@ export class GmailProvider implements MailProvider {
     // Gmail attachment ids change on every fetch, so inboxmux exposes the stable
     // MIME part id and resolves the current attachment id here.
     const message = await this.http.json<GmailMessage>(`${BASE}/messages/${enc(messageId)}?format=full`)
-    const part = findPart(message.payload, attachmentId)
-    if (!part) throw new UserFacingError('not_found', `Message ${messageId} has no attachment ${attachmentId}.`, 404)
+    return this.partData(message, attachmentId)
+  }
+
+  private async partData(message: GmailMessage, partId: string): Promise<AttachmentData> {
+    const part = findPart(message.payload, partId)
+    if (!part) throw new UserFacingError('not_found', `Message ${message.id} has no attachment ${partId}.`, 404)
     let data: Buffer
     if (part.body?.attachmentId) {
       const body = await this.http.json<{ data?: string }>(
-        `${BASE}/messages/${enc(messageId)}/attachments/${enc(part.body.attachmentId)}`,
+        `${BASE}/messages/${enc(message.id)}/attachments/${enc(part.body.attachmentId)}`,
       )
       data = Buffer.from(body.data ?? '', 'base64url')
     } else {

@@ -106,7 +106,7 @@ ${message}
 <div class="grid"><div class="card"><strong>Gmail</strong>${google}</div><div class="card"><strong>Microsoft 365 / Outlook.com</strong>${microsoft}</div></div>
 <h2>Settings</h2>
 <div class="card"><p>Sending: <strong>${v.capabilities.send ? 'enabled' : 'disabled'}</strong>. Trash: <strong>${v.capabilities.trash ? 'enabled' : 'disabled'}</strong>.</p>
-<p class="muted">Change these in <code>${esc(v.configDir)}/config.json</code> (capabilities.send, capabilities.trash). Drafts are always allowed.</p></div>`,
+<p class="muted">Both are on by default and your MCP client asks you before every send or trash call. To turn one off, set capabilities.send or capabilities.trash to false in <code>${esc(v.configDir)}/config.json</code>.</p></div>`,
   )
 }
 

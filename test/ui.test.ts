@@ -131,7 +131,7 @@ describe('account manager UI', () => {
     const start = await http(port, '/connect/microsoft', { cookie, form: { csrf: SESSION } })
     const auth = new URL(String(start.headers.location))
     expect(auth.origin).toBe('https://login.microsoftonline.com')
-    expect(auth.searchParams.get('scope')).toBe('offline_access User.Read Mail.ReadWrite')
+    expect(auth.searchParams.get('scope')).toBe('offline_access User.Read Mail.ReadWrite Mail.Send')
     const state = auth.searchParams.get('state') ?? ''
     const res = await http(port, `/oauth/microsoft/callback?error=access_denied&error_subcode=cancel&state=${state}`)
     expect(res.status).toBe(400)

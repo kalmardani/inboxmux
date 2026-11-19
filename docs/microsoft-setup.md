@@ -19,7 +19,7 @@ Under **API permissions > Add a permission > Microsoft Graph > Delegated permiss
 - `User.Read`
 - `Mail.ReadWrite`
 - `offline_access`
-- `Mail.Send` (only if you plan to enable sending)
+- `Mail.Send` (sending is on by default, leave it out only if you switch sending off)
 
 Personal accounts consent for themselves during sign in. In many organisations an administrator has to grant consent for `Mail.ReadWrite`. The sign in page tells you when that is the case.
 
@@ -67,5 +67,6 @@ inboxmux setup microsoft --client-id <id> --tenant organizations
 
 - Microsoft rotates refresh tokens on every use. inboxmux stores the new one automatically.
 - inboxmux requests immutable message ids, so ids stay valid after a message is archived or moved.
-- `Mail.Send` is only requested when sending is enabled at the time you connect. Enabling sending later means reconnecting the account.
-- Labels map to Outlook categories, starring maps to the follow up flag, archive moves the message to the Archive folder.
+- `Mail.Send` is requested when sending is on at the time you connect, which is the default. If you connect with sending off and switch it on later, reconnect the account.
+- Labels map to Outlook categories, starring maps to the follow up flag, archive moves the message to the Archive folder, spam to Junk Email.
+- Files up to 2.5 MB are attached in one request, larger ones through an upload session in 3.75 MB chunks.

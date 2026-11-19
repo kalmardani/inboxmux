@@ -17,9 +17,14 @@ import {
   type SearchQuery,
   type SearchResult,
 } from '../types.js'
+import { safeMimeType } from './mime.js'
 import { htmlToText, tidy, truncate } from './text.js'
 
 export const GRAPH_ROOT = 'https://graph.microsoft.com/v1.0/me'
+/** Graph accepts one request up to about 4 MB, so larger files go through an upload session. */
+const SMALL_ATTACHMENT_BYTES = 2_500_000
+/** Upload session chunks must be multiples of 320 KiB. */
+const UPLOAD_CHUNK_BYTES = 320 * 1024 * 12
 const SELECT =
   'id,conversationId,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,bodyPreview,isRead,hasAttachments,webLink,flag,categories,isDraft'
 
@@ -135,6 +140,22 @@ function recipients(emails: string[]): GraphRecipient[] {
   return emails.map((address) => ({ emailAddress: { address } }))
 }
 
+/** Upload sessions return a pre-authenticated URL. Only Microsoft mail hosts over HTTPS are accepted. */
+export function checkUploadUrl(url: string | undefined): string {
+  let parsed: URL
+  try {
+    parsed = new URL(url ?? '')
+  } catch {
+    throw new UserFacingError('invalid_upload_url', 'Microsoft returned no usable upload address for the attachment.')
+  }
+  const host = parsed.hostname.toLowerCase()
+  const microsoft = ['office.com', 'office365.com'].some((domain) => host === `outlook.${domain}` || host.endsWith(`.${domain}`))
+  if (parsed.protocol !== 'https:' || !microsoft) {
+    throw new UserFacingError('invalid_upload_url', 'Microsoft returned an unexpected upload address, the attachment was not sent there.')
+  }
+  return parsed.toString()
+}
+
 export class GraphProvider implements MailProvider {
   constructor(
     private readonly account: AccountMeta,
@@ -196,6 +217,24 @@ export class GraphProvider implements MailProvider {
     return folders
   }
 
+  async createFolder(name: string): Promise<FolderInfo> {
+    const cut = name.lastIndexOf('/')
+    const leaf = cut >= 0 ? name.slice(cut + 1) : name
+    let url = `${GRAPH_ROOT}/mailFolders`
+    if (cut >= 0) {
+      const parentName = name.slice(0, cut).toLowerCase()
+      const parent = (await this.listFolders()).find((f) => f.name.toLowerCase() === parentName)
+      if (!parent) throw new UserFacingError('unknown_folder', `No folder "${name.slice(0, cut)}" in ${this.account.email} to create it in.`, 404)
+      url = `${GRAPH_ROOT}/mailFolders/${enc(parent.id)}/childFolders`
+    }
+    const folder = await this.http.json<{ id: string; displayName: string }>(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: leaf }),
+    })
+    return { id: folder.id, name: cut >= 0 ? `${name.slice(0, cut)}/${folder.displayName}` : folder.displayName, kind: 'user' }
+  }
+
   async updateMessage(id: string, changes: MessageChanges): Promise<void> {
     const patch: Record<string, unknown> = {}
     if (changes.read !== undefined) patch.isRead = changes.read
@@ -213,37 +252,71 @@ export class GraphProvider implements MailProvider {
         body: JSON.stringify(patch),
       })
     }
-    if (changes.archived !== undefined) await this.move(id, changes.archived ? 'archive' : 'inbox')
+    if (changes.moveTo !== undefined) await this.move(id, await this.folderId(changes.moveTo))
+  }
+
+  /** inbox, archive and spam map to well-known folders, anything else must match a folder id or name. */
+  private async folderId(target: string): Promise<string> {
+    const key = target.trim().toLowerCase()
+    if (key === 'trash') throw new UserFacingError('invalid_request', 'Use trash_message to move a message to trash.')
+    const wellKnown: Record<string, string> = { inbox: 'inbox', archive: 'archive', spam: 'junkemail', junk: 'junkemail' }
+    if (wellKnown[key]) return wellKnown[key] as string
+    const hit = (await this.listFolders()).find((f) => f.id === target || f.name.toLowerCase() === key)
+    if (!hit) {
+      throw new UserFacingError('unknown_folder', `No folder "${target}" in ${this.account.email}. list_folders shows the folders.`, 404)
+    }
+    return hit.id
   }
 
   async createDraft(input: DraftInput): Promise<DraftResult> {
     const body = { contentType: input.html ? 'HTML' : 'Text', content: input.body }
+    const json = { 'Content-Type': 'application/json' }
     let draft: GraphMessage
-    if (input.replyToMessageId) {
-      const action = input.replyAll ? 'createReplyAll' : 'createReply'
-      draft = await this.http.json<GraphMessage>(`${GRAPH_ROOT}/messages/${enc(input.replyToMessageId)}/${action}`, {
+    const source = input.forwardMessageId ?? input.replyToMessageId
+    if (source) {
+      const forward = Boolean(input.forwardMessageId)
+      if (forward && !input.to.length) throw new UserFacingError('invalid_draft', 'A forward needs at least one recipient in `to`.')
+      const action = forward ? 'createForward' : input.replyAll ? 'createReplyAll' : 'createReply'
+      const payload = forward
+        ? { toRecipients: recipients(input.to), ...(input.html ? {} : { comment: input.body }) }
+        : input.html
+          ? { message: { body } }
+          : { comment: input.body }
+      draft = await this.http.json<GraphMessage>(`${GRAPH_ROOT}/messages/${enc(source)}/${action}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(input.html ? { message: { body } } : { comment: input.body }),
+        headers: json,
+        body: JSON.stringify(payload),
       })
       const patch: Record<string, unknown> = {}
-      if (input.to.length) patch.toRecipients = recipients(input.to)
+      if (input.to.length && !forward) patch.toRecipients = recipients(input.to)
       if (input.cc.length) patch.ccRecipients = [...(draft.ccRecipients ?? []), ...recipients(input.cc)]
       if (input.bcc.length) patch.bccRecipients = recipients(input.bcc)
       if (input.subject) patch.subject = input.subject
       if (input.from) patch.from = { emailAddress: { address: input.from } }
+      if (forward && input.html) {
+        // createForward has no HTML comment, so the new text goes on top of the quoted original.
+        const current = await this.http.json<GraphMessage>(`${GRAPH_ROOT}/messages/${enc(draft.id)}?$select=body`, {
+          headers: { Prefer: this.prefer({ format: 'html', maxChars: 0 }) },
+        })
+        const existing = current.body?.content ?? ''
+        const merged = /<body[^>]*>/i.test(existing)
+          ? existing.replace(/<body[^>]*>/i, (tag) => `${tag}${input.body}<br>`)
+          : `${input.body}<br>${existing}`
+        patch.body = { contentType: 'HTML', content: merged }
+      }
       if (Object.keys(patch).length) {
         draft = await this.http.json<GraphMessage>(`${GRAPH_ROOT}/messages/${enc(draft.id)}`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          headers: json,
           body: JSON.stringify(patch),
         })
       }
+      if (forward && input.includeOriginalAttachments === false) await this.removeAttachments(draft.id)
     } else {
       if (!input.to.length) throw new UserFacingError('invalid_draft', 'A draft needs at least one recipient in `to`.')
       draft = await this.http.json<GraphMessage>(`${GRAPH_ROOT}/messages`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: json,
         body: JSON.stringify({
           subject: input.subject ?? '',
           body,
@@ -254,7 +327,49 @@ export class GraphProvider implements MailProvider {
         }),
       })
     }
+    for (const file of input.attachments ?? []) await this.attach(draft.id, file)
     return { draftId: draft.id, messageId: draft.id, threadId: draft.conversationId, webLink: draft.webLink }
+  }
+
+  private async attach(draftId: string, file: AttachmentData): Promise<void> {
+    const base = `${GRAPH_ROOT}/messages/${enc(draftId)}/attachments`
+    const json = { 'Content-Type': 'application/json' }
+    const contentType = safeMimeType(file.mimeType)
+    const size = file.data.length
+    if (size <= SMALL_ATTACHMENT_BYTES) {
+      await this.http.send(base, {
+        method: 'POST',
+        headers: json,
+        body: JSON.stringify({
+          '@odata.type': '#microsoft.graph.fileAttachment',
+          name: file.filename,
+          contentType,
+          contentBytes: file.data.toString('base64'),
+        }),
+      })
+      return
+    }
+    const session = await this.http.json<{ uploadUrl?: string }>(`${base}/createUploadSession`, {
+      method: 'POST',
+      headers: json,
+      body: JSON.stringify({ AttachmentItem: { attachmentType: 'file', name: file.filename, size, contentType } }),
+    })
+    const url = checkUploadUrl(session.uploadUrl)
+    for (let start = 0; start < size; start += UPLOAD_CHUNK_BYTES) {
+      const end = Math.min(start + UPLOAD_CHUNK_BYTES, size)
+      await this.http.external(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream', 'Content-Range': `bytes ${start}-${end - 1}/${size}` },
+        body: new Uint8Array(file.data.subarray(start, end)),
+      })
+    }
+  }
+
+  private async removeAttachments(draftId: string): Promise<void> {
+    const list = await this.http.json<GraphList<{ id: string }>>(`${GRAPH_ROOT}/messages/${enc(draftId)}/attachments?$select=id`)
+    for (const a of list.value ?? []) {
+      await this.http.send(`${GRAPH_ROOT}/messages/${enc(draftId)}/attachments/${enc(a.id)}`, { method: 'DELETE' })
+    }
   }
 
   async draftRecipients(draftId: string): Promise<string[]> {

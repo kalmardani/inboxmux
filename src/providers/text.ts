@@ -84,3 +84,8 @@ export function truncate(text: string, maxChars: number): { text: string; trunca
   if (text.length <= maxChars) return { text, truncated: false }
   return { text: `${text.slice(0, maxChars)}\n[truncated, ${text.length - maxChars} more characters]`, truncated: true }
 }
+
+/** Escapes text for safe inclusion in an HTML body. */
+export function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}

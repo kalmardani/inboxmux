@@ -1,6 +1,6 @@
 {
   "name": "inboxmux",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "One MCP server for many mailboxes. Connect several Gmail and Microsoft 365 / Outlook accounts and use them from Claude, Codex or any MCP client.",
   "type": "module",
   "bin": {

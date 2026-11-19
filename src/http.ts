@@ -86,6 +86,18 @@ export interface AuthedClient {
   json<T>(url: string, init?: RequestInit): Promise<T>
   buffer(url: string, init?: RequestInit): Promise<Buffer>
   send(url: string, init?: RequestInit): Promise<void>
+  /**
+   * Calls a pre-authenticated URL handed out by the provider (Microsoft
+   * attachment upload sessions). The bearer token is never sent there.
+   */
+  external<T>(url: string, init?: RequestInit): Promise<T>
+}
+
+/** Large uploads get more time than ordinary API calls. */
+function timeoutFor(init: RequestInit): number {
+  const body = init.body
+  const size = typeof body === 'string' ? body.length : body instanceof Uint8Array ? body.byteLength : 0
+  return size > 1_000_000 ? 180_000 : 20_000
 }
 
 /**
@@ -105,7 +117,7 @@ export function authedClient(opts: {
       const headers = new Headers(init.headers)
       headers.set('Authorization', `Bearer ${token}`)
       for (const [k, v] of Object.entries(opts.extraHeaders ?? {})) if (!headers.has(k)) headers.set(k, v)
-      const response = await fetchWithRetry(opts.fetchFn, url, { ...init, headers })
+      const response = await fetchWithRetry(opts.fetchFn, url, { ...init, headers }, { timeoutMs: timeoutFor(init) })
       if (response.status === 401 && !force) {
         await response.body?.cancel()
         continue
@@ -126,6 +138,12 @@ export function authedClient(opts: {
     },
     async send(url: string, init?: RequestInit) {
       await (await call(url, init)).body?.cancel()
+    },
+    async external<T>(url: string, init: RequestInit = {}) {
+      const response = await fetchWithRetry(opts.fetchFn, url, init, { timeoutMs: timeoutFor(init) })
+      if (!response.ok) throw await providerError(opts.provider, response, opts.email)
+      const text = await response.text()
+      return (text ? JSON.parse(text) : {}) as T
     },
   }
 }

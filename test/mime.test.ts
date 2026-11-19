@@ -55,8 +55,26 @@ describe('buildMime', () => {
 
   it('builds multipart alternative for html', () => {
     const raw = buildMime({ ...base, body: '<p>Hello <b>you</b></p>', html: true })
-    expect(raw).toMatch(/multipart\/alternative; boundary="inboxmux_[0-9a-f]+"/)
+    expect(raw).toMatch(/multipart\/alternative; boundary="inboxmux_alt_[0-9a-f]+"/)
     expect(raw.match(/Content-Type: text\/(plain|html)/g)).toEqual(['Content-Type: text/plain', 'Content-Type: text/html'])
+  })
+
+  it('adds attachments as multipart/mixed with safe encoded filenames', () => {
+    const raw = buildMime({
+      ...base,
+      body: 'See attached',
+      attachments: [
+        { filename: 'Számla 2026.pdf', mimeType: 'application/pdf', data: Buffer.from('%PDF-1.7') },
+        { filename: 'evil"\r\nBcc: x@evil.com.txt', mimeType: 'text/plain; x=\r\n', data: Buffer.from('hi') },
+      ],
+    })
+    expect(raw).toMatch(/Content-Type: multipart\/mixed; boundary="inboxmux_mix_[0-9a-f]+"/)
+    expect(raw).toContain('Content-Type: text/plain; charset="UTF-8"')
+    expect(raw).toContain(`filename="=?UTF-8?B?${Buffer.from('Számla 2026.pdf').toString('base64')}?="`)
+    expect(raw).toContain(Buffer.from('%PDF-1.7').toString('base64'))
+    expect(raw).not.toMatch(/^Bcc:/m)
+    expect(raw).toContain('Content-Type: application/octet-stream; name="evil___Bcc: x@evil.com.txt"')
+    expect(raw.trimEnd().endsWith('--')).toBe(true)
   })
 
   it('encodes non ASCII display names', () => {

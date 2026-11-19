@@ -83,7 +83,7 @@ function assertHeaderSafe(name: string, value: string): void {
 }
 
 /** Encodes a header value as RFC 2047 UTF-8 base64 words when it is not plain ASCII. */
-export function encodeHeaderValue(value: string): string {
+export function encodeHeaderValue(value: string, separator = '\r\n '): string {
   if (/^[\x20-\x7e]*$/.test(value)) return value
   const words: string[] = []
   let chunk = ''
@@ -95,7 +95,19 @@ export function encodeHeaderValue(value: string): string {
     chunk += ch
   }
   if (chunk) words.push(chunk)
-  return words.map((w) => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n ')
+  return words.map((w) => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join(separator)
+}
+
+/** Quoted filename parameter. Line breaks, quotes and backslashes are replaced, non ASCII becomes RFC 2047 words. */
+export function filenameParam(name: string): string {
+  const clean = name.replace(/[\r\n\0"\\]/g, '_').trim().slice(0, 200) || 'attachment'
+  return `"${encodeHeaderValue(clean, ' ')}"`
+}
+
+/** Accepts only a plain type/subtype, anything else becomes application/octet-stream. */
+export function safeMimeType(type: string | undefined): string {
+  const t = (type ?? '').trim().toLowerCase()
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/.test(t) ? t : 'application/octet-stream'
 }
 
 export function formatAddress(address: Address): string {
@@ -108,9 +120,18 @@ export function formatAddress(address: Address): string {
   return `${name} <${address.email}>`
 }
 
+function base64Bytes(data: Buffer): string {
+  return (data.toString('base64').match(/.{1,76}/g) ?? ['']).join('\r\n')
+}
+
 function base64Lines(text: string): string {
-  const normalized = text.replace(/\r?\n/g, '\r\n')
-  return (Buffer.from(normalized, 'utf8').toString('base64').match(/.{1,76}/g) ?? ['']).join('\r\n')
+  return base64Bytes(Buffer.from(text.replace(/\r?\n/g, '\r\n'), 'utf8'))
+}
+
+export interface MimeAttachment {
+  filename: string
+  mimeType: string
+  data: Buffer
 }
 
 export interface MimeInput {
@@ -123,6 +144,27 @@ export interface MimeInput {
   html: boolean
   inReplyTo?: string
   references?: string
+  attachments?: MimeAttachment[]
+}
+
+function boundary(kind: string): string {
+  return `inboxmux_${kind}_${randomBytes(12).toString('hex')}`
+}
+
+/** The body as one MIME entity: plain text, or text plus HTML as multipart/alternative. */
+function bodyEntity(input: MimeInput): string {
+  if (!input.html) {
+    return `Content-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${base64Lines(input.body)}\r\n`
+  }
+  const b = boundary('alt')
+  const part = (type: string, content: string) =>
+    `--${b}\r\nContent-Type: ${type}; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${base64Lines(content)}\r\n`
+  return (
+    `Content-Type: multipart/alternative; boundary="${b}"\r\n\r\n` +
+    part('text/plain', htmlToText(input.body)) +
+    part('text/html', input.body) +
+    `--${b}--\r\n`
+  )
 }
 
 /** Builds an RFC 5322 message. Every header value is checked for line breaks (header injection). */
@@ -143,18 +185,16 @@ export function buildMime(input: MimeInput): string {
   if (input.inReplyTo) header('In-Reply-To', input.inReplyTo)
   if (input.references) header('References', input.references)
   lines.push('MIME-Version: 1.0')
-  if (!input.html) {
-    lines.push('Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64')
-    return `${lines.join('\r\n')}\r\n\r\n${base64Lines(input.body)}\r\n`
+  const head = `${lines.join('\r\n')}\r\n`
+  if (!input.attachments?.length) return head + bodyEntity(input)
+  const mixed = boundary('mix')
+  let out = `${head}Content-Type: multipart/mixed; boundary="${mixed}"\r\n\r\n--${mixed}\r\n${bodyEntity(input)}`
+  for (const file of input.attachments) {
+    const name = filenameParam(file.filename)
+    out +=
+      `--${mixed}\r\nContent-Type: ${safeMimeType(file.mimeType)}; name=${name}\r\n` +
+      `Content-Disposition: attachment; filename=${name}\r\nContent-Transfer-Encoding: base64\r\n\r\n` +
+      `${base64Bytes(file.data)}\r\n`
   }
-  const boundary = `inboxmux_${randomBytes(12).toString('hex')}`
-  lines.push(`Content-Type: multipart/alternative; boundary="${boundary}"`)
-  const part = (type: string, content: string) =>
-    `--${boundary}\r\nContent-Type: ${type}; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${base64Lines(content)}\r\n`
-  return (
-    `${lines.join('\r\n')}\r\n\r\n` +
-    part('text/plain', htmlToText(input.body)) +
-    part('text/html', input.body) +
-    `--${boundary}--\r\n`
-  )
+  return `${out}--${mixed}--\r\n`
 }

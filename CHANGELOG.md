@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0
+
+- Sending and trash are on by default, every call goes through the client's approval prompt. `capabilities.send` or `capabilities.trash` set to `false` removes the tools
+- `send_message` sends a new message, reply, reply all or forward in one step, checked against `sendAllowlist` on the saved draft
+- Forwarding with `forwardMessageId`, keeping the original attachments unless `includeOriginalAttachments` is false
+- Local file attachments from `attachmentSources` (home folder by default), never hidden files or the config folder, 25 MB per message
+- Large messages use the Gmail upload endpoint and Microsoft upload sessions, the session URL never receives the bearer token
+- `update_message` takes `moveTo` for inbox, archive, spam or any folder or label, and restores messages from trash
+- `create_folder` creates Gmail labels and Outlook folders
+- `INBOXMUX_ALLOW_SEND` and `INBOXMUX_ALLOW_TRASH` accept `0`, `false`, `no` and `off`
+
 ## 0.1.0
 
 First release.

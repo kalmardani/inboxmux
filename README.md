@@ -18,9 +18,12 @@ Claude Code / Claude Desktop / Codex / any MCP client
 - `search_messages` with `account: "all"` searches every mailbox in parallel and merges the results newest first
 - Structured filters (from, to, subject, dates, unread, attachments, folder) plus each provider's native search syntax
 - Read messages and whole conversations as clean text, save attachments to a local folder
-- Mark read, star or flag, archive, Gmail labels and Outlook categories
-- Drafts, replies and reply all with correct threading, including Gmail send-as aliases
-- Sending and trashing are off by default and can be enabled separately, with a recipient allowlist
+- Send new messages, replies, reply all and forwards in one step, or save them as drafts first
+- Attach local files and keep the original attachments when forwarding, up to 25 MB per message
+- Gmail send-as aliases and correct threading for replies and forwards
+- Mark read, star or flag, move to inbox, archive, spam or any folder, restore from trash, trash
+- Gmail labels and Outlook categories, create new labels and folders
+- An optional recipient allowlist and an audit log of every write action
 - A local web page to connect, label, check and remove accounts
 - No cloud service in between. Your mail goes from the provider API straight to your MCP client
 
@@ -99,20 +102,26 @@ Accounts added later in `inboxmux ui` show up in a running server without a rest
 | `get_message` | One message as text or HTML, with attachment list | no |
 | `get_thread` | A whole conversation, oldest first | no |
 | `list_folders` | Gmail labels or Outlook folders | no |
-| `update_message` | Read or unread, star or flag, archive, add or remove labels | reversible |
-| `create_draft` | New draft, reply or reply all, optional send-as alias | draft only |
+| `create_folder` | New Gmail label or Outlook folder, `Parent/Child` for nesting | reversible |
+| `update_message` | Read or unread, star or flag, move to inbox, archive, spam or a folder, restore from trash, labels | reversible |
+| `create_draft` | New message, reply, reply all or forward saved as a draft, with attachments and send-as alias | draft only |
+| `send_message` | Same fields as `create_draft`, sends right away | sends |
+| `send_draft` | Sends a saved draft | sends |
 | `get_attachment` | Saves an attachment to the attachments folder and returns the path | local file |
-| `send_draft` | Sends a draft. Only registered when sending is enabled | yes |
-| `trash_message` | Moves a message to trash. Only registered when trash is enabled | yes |
+| `trash_message` | Moves a message to trash, `update_message` with `moveTo: "inbox"` brings it back | reversible |
 
 Every tool takes `account` as an email address or a label. Message and thread ids belong to the account they came from.
+
+`send_message`, `send_draft` and `trash_message` are registered by default. Set `capabilities.send` or `capabilities.trash` to `false` to remove them, a model cannot call a tool it does not see.
 
 ## Safety model
 
 Mail is private data that strangers can write into, which makes it a prime channel for prompt injection. inboxmux limits what an injected instruction could achieve.
 
-- **No sending by default.** `send_draft` and `trash_message` are not even registered unless you enable them. The assistant writes drafts, you press send in your mail app.
-- **Recipient allowlist.** With sending enabled, `sendAllowlist` can restrict recipients to exact addresses or `@domain` entries. The server checks the saved draft, not the model's claim.
+- **You approve every send.** Sending and trash tools carry the destructive annotation, so Claude, Codex and other clients ask before each call. The server instructions tell the model to send only what the user asked for and to show recipients, subject and text first. Never set your client to auto-approve `send_message`, `send_draft` or `trash_message`.
+- **Switch off what you do not need.** `capabilities.send` and `capabilities.trash` remove those tools entirely.
+- **Recipient allowlist.** `sendAllowlist` can restrict recipients to exact addresses or `@domain` entries. The server checks the saved draft, not the model's claim, and keeps a blocked message as a draft.
+- **Local files stay put unless you name them.** Attachments are only read from the folders in `attachmentSources` (your home folder by default). Links are resolved first, hidden files and folders (`.ssh`, `.aws`, `.env`, `.config`) and the inboxmux config folder are always refused.
 - **Untrusted content is labelled.** Every response that carries message content includes a notice that the content comes from outside senders. Invisible Unicode characters are stripped from bodies.
 - **Narrow tools.** No raw HTTP or query passthrough beyond the provider search string. Ids are validated and URL encoded, paging tokens are bound to the provider host.
 - **Tokens at rest.** Refresh tokens are encrypted with AES-256-GCM. The key lives in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service), or in `INBOXMUX_MASTER_KEY`, or as a last resort in a `0600` key file. Access tokens are kept in memory only.
@@ -129,9 +138,10 @@ Settings live in `~/.config/inboxmux/config.json` (or `$INBOXMUX_HOME`, or `$XDG
 {
   "google": { "clientId": "....apps.googleusercontent.com", "clientSecret": "..." },
   "microsoft": { "clientId": "GUID", "tenant": "common" },
-  "capabilities": { "send": false, "trash": false },
+  "capabilities": { "send": true, "trash": true },
   "sendAllowlist": ["@mycompany.com", "friend@example.com"],
   "attachmentsDir": "/Users/me/Downloads/inboxmux",
+  "attachmentSources": ["~/Documents", "~/Desktop", "/Volumes/Projects"],
   "uiPort": 8765
 }
 ```
@@ -143,14 +153,16 @@ Environment variables override the file.
 | `INBOXMUX_HOME` | Config folder |
 | `INBOXMUX_GOOGLE_CLIENT_ID`, `INBOXMUX_GOOGLE_CLIENT_SECRET` | Google OAuth client |
 | `INBOXMUX_MICROSOFT_CLIENT_ID`, `INBOXMUX_MICROSOFT_CLIENT_SECRET`, `INBOXMUX_MICROSOFT_TENANT` | Microsoft app |
-| `INBOXMUX_ALLOW_SEND`, `INBOXMUX_ALLOW_TRASH` | `1` or `true` to enable |
+| `INBOXMUX_ALLOW_SEND`, `INBOXMUX_ALLOW_TRASH` | `0` or `false` to switch off, `1` or `true` to switch on |
 | `INBOXMUX_ATTACHMENTS_DIR` | Where `get_attachment` saves files |
 | `INBOXMUX_UI_PORT` | Port of the account manager (default 8765) |
 | `INBOXMUX_MASTER_KEY` | Base64 encoded 32 byte key instead of the keychain |
 | `INBOXMUX_NO_KEYCHAIN` | `1` to skip the keychain |
 | `INBOXMUX_LOG` | `debug` for verbose stderr logging |
 
-Changing the Microsoft tenant or enabling sending later requires reconnecting Microsoft accounts so they grant `Mail.Send`.
+All keys are optional. Without `capabilities` both are on, without `attachmentSources` files can be attached from your home folder, without `sendAllowlist` any recipient is allowed.
+
+Changing the Microsoft tenant, or switching sending back on after connecting with it off, requires reconnecting Microsoft accounts so they grant `Mail.Send`.
 
 ## Command line
 
@@ -167,7 +179,7 @@ inboxmux import google            import an existing Google refresh token from s
 
 ## Scope and roadmap
 
-Version 0.1 covers Gmail and Microsoft Graph mailboxes over stdio. The Gmail adapter has been used against real mailboxes. The Microsoft adapter is covered by contract tests and its sign in flow was checked against two Microsoft 365 tenants, but it has not yet read a live mailbox, because both tenants required administrator approval. Reports from Microsoft users are welcome. Planned next are a generic IMAP and SMTP adapter, attachments on drafts, a remote Streamable HTTP mode for web and mobile clients, and calendar access.
+Version 0.2 covers Gmail and Microsoft Graph mailboxes over stdio. Search and reading in the Gmail adapter have been used against real mailboxes. Sending, forwarding, attachments and moves are covered by contract tests against the documented API behaviour. The Microsoft adapter is covered by contract tests and its sign in flow was checked against two Microsoft 365 tenants, but it has not yet read a live mailbox, because both tenants required administrator approval. Reports from Microsoft users are welcome. Planned next are a generic IMAP and SMTP adapter, a remote Streamable HTTP mode for web and mobile clients, and calendar access.
 
 ## Development
 

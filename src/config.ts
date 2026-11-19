@@ -29,6 +29,7 @@ const ConfigFileSchema = z
     capabilities: z.object({ send: z.boolean().optional(), trash: z.boolean().optional() }).strict().optional(),
     sendAllowlist: z.array(z.string().min(3)).optional(),
     attachmentsDir: z.string().min(1).optional(),
+    attachmentSources: z.array(z.string().min(1)).max(20).optional(),
   })
   .strict()
 
@@ -39,10 +40,13 @@ export interface Config {
   uiPort: number
   google: { clientId?: string; clientSecret?: string }
   microsoft: { clientId?: string; clientSecret?: string; tenant: string }
+  /** Both on by default. The MCP client asks the user before each send or trash call. */
   capabilities: { send: boolean; trash: boolean }
-  /** Exact addresses or `@domain` entries. Empty means no restriction once sending is enabled. */
+  /** Exact addresses or `@domain` entries. Empty means no restriction. */
   sendAllowlist: string[]
   attachmentsDir: string
+  /** Folders whose files may be attached to outgoing mail. Hidden files and folders inside them are always refused. */
+  attachmentSources: string[]
 }
 
 export function configPath(dir: string): string {
@@ -75,7 +79,10 @@ export function updateConfigFile(dir: string, mutate: (config: ConfigFile) => vo
 
 function flag(value: string | undefined): boolean | undefined {
   if (value === undefined || value === '') return undefined
-  return value === '1' || value.toLowerCase() === 'true'
+  const v = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true
+  if (['0', 'false', 'no', 'off'].includes(v)) return false
+  return undefined
 }
 
 /** Reads config.json and applies INBOXMUX_* environment overrides. */
@@ -99,10 +106,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       tenant,
     },
     capabilities: {
-      send: flag(env.INBOXMUX_ALLOW_SEND) ?? file.capabilities?.send ?? false,
-      trash: flag(env.INBOXMUX_ALLOW_TRASH) ?? file.capabilities?.trash ?? false,
+      send: flag(env.INBOXMUX_ALLOW_SEND) ?? file.capabilities?.send ?? true,
+      trash: flag(env.INBOXMUX_ALLOW_TRASH) ?? file.capabilities?.trash ?? true,
     },
     sendAllowlist: (file.sendAllowlist ?? []).map((entry) => entry.toLowerCase()),
     attachmentsDir: env.INBOXMUX_ATTACHMENTS_DIR || file.attachmentsDir || join(homedir(), 'Downloads', 'inboxmux'),
+    attachmentSources: (file.attachmentSources ?? [homedir()]).map((dir) => (dir.startsWith('~/') ? join(homedir(), dir.slice(2)) : dir)),
   }
 }
